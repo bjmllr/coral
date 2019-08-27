@@ -42,11 +42,32 @@ function onActivate(event) {
   event.waitUntil(self.clients.claim());
 }
 
+// try to avoid multiple replays
+var globalReplayLock = true;
+
+console.log(1);
+
 // Borrowed from https://github.com/TalAter/UpUp
 function onFetch(event) {
   event.respondWith(
     // try to return untouched request from network first
-    fetch(event.request.clone()).catch(function() {
+    fetch(event.request.clone()).then(function(res) {
+      // if a request succeeds, then we can conclude that the server is
+      // reachable again and we can begin replay. this doesn't seem to work
+      // again after we are back in online mode, so we probably want some kind
+      // of button to force a replay attempt instead/also.
+      console.log('online request succeeded', event);
+      if (globalReplayLock) {
+        globalReplayLock = false;
+        console.log('starting replay');
+
+        initWriteDatabase()
+          .then(db => replayAllWrites(db))
+          .catch(console.error);
+      }
+
+      return res;
+    }).catch(function() {
       // if it fails, try to return request from the cache
       console.log('stepping in');
       console.log(event.request);
@@ -115,22 +136,72 @@ function delayRequest(request) {
     .catch(console.error);
 }
 
+function serializeRequest(request) {
+  return new Promise((resolve, reject) => {
+    var headers = {};
+    for (var header of request.headers.entries()) {
+      headers[header[0]] = header[1];
+    }
+
+    var serialized = {
+      url: request.url,
+      headers: headers,
+      method: request.method,
+    };
+
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      return request.clone().text().then(function(body) {
+        serialized.body = body;
+        return resolve(serialized);
+      });
+    } else {
+      return resolve(serialized);
+    }
+  });
+}
+
 function storeRequestAsWrite(db, request) {
   return new Promise((resolve, reject) => {
-    var requestKey = (new Date()).toISOString();
-    var storableRequest = {
-      url: request.url,
-    };
-    console.log('storable request', storableRequest);
-    var dbAdd = db.transaction(["writes"], 'readwrite')
-      .objectStore("writes")
-      .add({
-        key: requestKey,
-        request: storableRequest,
-        status: 'queued',
+    serializeRequest(request).then(
+      (storableRequest) => {
+        console.log('storable request', storableRequest);
+        var requestKey = (new Date()).toISOString();
+        var dbAdd = db.transaction(["writes"], 'readwrite')
+                      .objectStore("writes")
+                      .add({
+                        key: requestKey,
+                        request: storableRequest,
+                        status: 'queued',
+                      });
+        dbAdd.onsuccess = resolve;
+        dbAdd.onerror = reject;
       });
-    dbAdd.onsuccess = resolve;
-    dbAdd.onerror = reject;
+  });
+}
+
+function replayAllWrites(db) {
+  return new Promise((resolve, reject) => {
+    console.log('replaying writes');
+    var writesCursorRequest = db.transaction("writes").objectStore("writes").openCursor();
+    writesCursorRequest.onsuccess = function(event) {
+      var cursor = event.target.result;
+      if(cursor) {
+        var write = cursor.value;
+
+        if (write.request.body && write.request.headers) {
+          console.log('replaying write', write);
+          fetch(write.request.url, write.request)
+            .then((res) => console.log('replayed write', write, res))
+            .catch(console.error);
+        } else {
+          console.log('skipping empty write', write);
+        }
+        cursor.continue();
+      } else {
+        resolve(true);
+      }
+    }
+    writesCursorRequest.onerror = reject;
   });
 }
 
